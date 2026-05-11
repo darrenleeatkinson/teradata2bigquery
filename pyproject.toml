@@ -22,6 +22,9 @@ dev = [
     "pytest>=8",
     "pytest-asyncio>=0.23",
 ]
+gemini = [
+    "google-genai>=1.0",
+]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

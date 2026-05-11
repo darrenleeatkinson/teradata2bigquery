@@ -4,7 +4,6 @@ import os
 from datetime import datetime
 from pathlib import Path
 
-import anthropic
 from dotenv import load_dotenv
 from google.cloud import bigquery
 from rich.console import Console
@@ -12,6 +11,7 @@ from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn
 
 from .classifier import classify
 from .fix_agent import fix
+from .providers import LLMProvider, create_provider
 from .reporter import generate
 from .state import ScriptRecord, StateStore, Status
 from .translator import load_system_prompt, translate
@@ -19,11 +19,16 @@ from .validator import validate
 
 console = Console()
 
+_PROVIDER_ENV_KEYS = {
+    "anthropic": "ANTHROPIC_API_KEY",
+    "gemini": "GOOGLE_API_KEY",
+}
+
 
 async def _process_one(
     record: ScriptRecord,
     store: StateStore,
-    anthropic_client: anthropic.AsyncAnthropic,
+    provider: LLMProvider,
     bq_client: bigquery.Client,
     output_dir: Path,
     execute: bool,
@@ -42,12 +47,12 @@ async def _process_one(
             store.upsert(record)
 
             project_id = os.environ["GCP_PROJECT_ID"]
-            bq_sql = await translate(sql, script_type, anthropic_client, project_id)
+            bq_sql = await translate(sql, script_type, provider, project_id)
             result = validate(bq_sql, bq_client, execute)
             attempts = 1
 
             while not result.ok and attempts < max_fix_attempts:
-                bq_sql = await fix(sql, bq_sql, result, anthropic_client, system_prompt)
+                bq_sql = await fix(sql, bq_sql, result, provider, system_prompt)
                 result = validate(bq_sql, bq_client, execute)
                 attempts += 1
 
@@ -74,8 +79,9 @@ async def run_pipeline(args: argparse.Namespace) -> None:
     if args.project:
         os.environ["GCP_PROJECT_ID"] = args.project
 
-    for required in ("ANTHROPIC_API_KEY", "GCP_PROJECT_ID"):
-        if not os.environ.get(required):
+    required_llm_key = _PROVIDER_ENV_KEYS.get(args.provider)
+    for required in (required_llm_key, "GCP_PROJECT_ID"):
+        if required and not os.environ.get(required):
             console.print(f"[red]Missing required environment variable: {required}[/red]")
             console.print("Copy .env.example to .env and fill in your credentials.")
             raise SystemExit(1)
@@ -109,11 +115,12 @@ async def run_pipeline(args: argparse.Namespace) -> None:
     mode = "EXECUTE" if args.execute else "DRY-RUN"
     console.print(
         f"[bold]Processing {len(pending)} scripts[/bold]  "
+        f"provider={args.provider}  model={args.model or 'default'}  "
         f"concurrency={args.concurrency}  mode={mode}  max-fix-attempts={args.max_fix_attempts}"
     )
 
+    provider = create_provider(args.provider, model=args.model)
     system_prompt = load_system_prompt()
-    anthropic_client = anthropic.AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
     bq_client = bigquery.Client(project=os.environ["GCP_PROJECT_ID"])
     semaphore = asyncio.Semaphore(args.concurrency)
 
@@ -124,10 +131,12 @@ async def run_pipeline(args: argparse.Namespace) -> None:
         TaskProgressColumn(),
         console=console,
     ) as progress:
-        task_id = progress.add_task("Converting...", total=len(pending))
+        task_id = progress.add_task(
+            f"Converting via {provider.model_name}...", total=len(pending)
+        )
         await asyncio.gather(*[
             _process_one(
-                rec, store, anthropic_client, bq_client,
+                rec, store, provider, bq_client,
                 output_dir, args.execute, args.max_fix_attempts,
                 system_prompt, semaphore, progress, task_id,
             )
@@ -152,10 +161,18 @@ def main() -> None:
     parser.add_argument("--input-dir", required=True, help="Directory containing .sql source files")
     parser.add_argument("--output-dir", required=True, help="Directory for converted SQL and report")
     parser.add_argument(
+        "--provider", default="anthropic", choices=["anthropic", "gemini"],
+        help="LLM provider to use (default: anthropic)",
+    )
+    parser.add_argument(
+        "--model", default=None,
+        help="Model name override — e.g. claude-opus-4-5, gemini-2.0-flash (default: provider default)",
+    )
+    parser.add_argument(
         "--execute", action="store_true",
         help="Run converted SQL against BigQuery (default: dry-run syntax check only)",
     )
-    parser.add_argument("--concurrency", type=int, default=10, help="Parallel Claude API calls (default: 10)")
+    parser.add_argument("--concurrency", type=int, default=10, help="Parallel LLM API calls (default: 10)")
     parser.add_argument("--max-fix-attempts", type=int, default=3, help="Max auto-fix retries per script (default: 3)")
     parser.add_argument("--project", help="GCP project ID (overrides GCP_PROJECT_ID in .env)")
     parser.add_argument("--resume", action="store_true", help="Skip scripts already marked SUCCESS in state.db")

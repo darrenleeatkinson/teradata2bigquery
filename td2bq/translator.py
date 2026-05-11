@@ -1,8 +1,7 @@
 from pathlib import Path
 
-import anthropic
-
 from .classifier import ScriptType
+from .providers import LLMProvider
 
 _SYSTEM_PROMPT: str | None = None
 _SYSTEM_PROMPT_PATH = Path(__file__).parent / "prompts" / "system.md"
@@ -18,31 +17,15 @@ def load_system_prompt() -> str:
 async def translate(
     sql: str,
     script_type: ScriptType,
-    client: anthropic.AsyncAnthropic,
+    provider: LLMProvider,
     project_id: str,
 ) -> str:
     system_prompt = load_system_prompt()
-    response = await client.messages.create(
-        model="claude-opus-4-5",
-        max_tokens=8192,
-        system=[
-            {
-                "type": "text",
-                "text": system_prompt,
-                "cache_control": {"type": "ephemeral"},
-            }
-        ],
-        messages=[
-            {
-                "role": "user",
-                "content": (
-                    f"Convert the following Teradata BTEQ script to BigQuery Standard SQL.\n"
-                    f"Script type: {script_type.value}\n"
-                    f"GCP project ID: {project_id}\n\n"
-                    f"Return ONLY the BigQuery SQL — no explanation, no markdown fences.\n\n"
-                    f"{sql}"
-                ),
-            }
-        ],
+    user_message = (
+        f"Convert the following Teradata BTEQ script to BigQuery Standard SQL.\n"
+        f"Script type: {script_type.value}\n"
+        f"GCP project ID: {project_id}\n\n"
+        f"Return ONLY the BigQuery SQL — no explanation, no markdown fences.\n\n"
+        f"{sql}"
     )
-    return response.content[0].text.strip()
+    return await provider.complete(system_prompt, user_message)
